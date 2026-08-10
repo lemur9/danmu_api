@@ -5,6 +5,13 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 // 跨异步生命周期链路的日志上下文追踪器
 export const sourceLogContext = new AsyncLocalStorage();
 
+// 单次搜索请求内的 HTTP 响应复用缓存: 相同 URL 的重复 GET 直接复用, 借助 AsyncLocalStorage 实现请求级隔离
+export const httpCacheContext = new AsyncLocalStorage();
+
+export function runWithHttpCache(fn) {
+  return httpCacheContext.run(new Map(), fn);
+}
+
 // 源调度键名（sourceOrderArr）到日志标签规范名称的映射
 // sourceOrderArr 中部分键名与对应源文件的标签命名不一致（如 360→360kan, imgo→mango）
 // 此映射表统一转换，确保 HTTP 日志标签与源文件内部标签一致
@@ -33,11 +40,11 @@ export function toLogSourceName(sourceKey) {
  * @returns {Function} 监听器清理闭包
  */
 function linkSignal(externalSignal, internalController) {
-  if (!externalSignal) return () => {};
+  if (!externalSignal) return () => { };
 
   if (externalSignal.aborted) {
     internalController.abort();
-    return () => {};
+    return () => { };
   }
 
   const abortHandler = () => {
@@ -53,6 +60,16 @@ function linkSignal(externalSignal, internalController) {
 }
 
 export async function httpGet(url, options = {}) {
+  // 单次搜索请求内 HTTP 响应复用: 若当前请求上下文已激活复用缓存且本 URL 已缓存, 直接返回克隆结果, 跳过重复网络请求
+  const requestHttpCache = httpCacheContext.getStore();
+  // 重试调用传入 bypassCache 时跳过复用，避免复用首次已缓存的失败响应而令重试被静默吞掉
+  const bypassCache = options.bypassCache === true;
+  if (requestHttpCache && !bypassCache && requestHttpCache.has(url)) {
+    const cached = requestHttpCache.get(url);
+    log("info", `[${sourceLogContext.getStore() || 'system'}] [请求复用] 复用请求内已缓存的 HTTP 响应, 跳过重复请求: ${url}`);
+    return { data: structuredClone(cached.data), status: cached.status, headers: { ...cached.headers } };
+  }
+
   // 从 options 中获取重试次数，默认为 0
   const maxRetries = parseInt(options.retries || '0', 10) || 0;
   // 提取允许放行的特定状态码白名单
@@ -89,7 +106,7 @@ export async function httpGet(url, options = {}) {
       // 兼容iOS巨魔环境：使用node-fetch替代内置fetch
       let response;
       if (typeof WebAssembly === 'undefined') {
-        log("info", "[Utils] [HTTP] iOS环境降级使用node-fetch");
+        log("info", "[system] [http] iOS环境降级使用node-fetch");
         const fetch = (await import('node-fetch')).default;
         response = await fetch(url, {
           method: 'GET',
@@ -119,7 +136,7 @@ export async function httpGet(url, options = {}) {
       let data;
 
       if (options.base64Data) {
-        log("info", "[Utils] [HTTP] base64模式");
+        log("info", "[system] [http] base64模式");
 
         // 先拿二进制
         const arrayBuffer = await response.arrayBuffer();
@@ -135,7 +152,7 @@ export async function httpGet(url, options = {}) {
         data = btoa(binary); // 得到 base64 字符串
 
       } else if (options.zlibMode) {
-        log("info", "[Utils] [HTTP] zlib模式")
+        log("info", "[system] [http] zlib模式")
 
         // 获取 ArrayBuffer
         const arrayBuffer = await response.arrayBuffer();
@@ -156,7 +173,7 @@ export async function httpGet(url, options = {}) {
           }
         } else {
           // iOS巨魔环境降级处理：使用pako库
-          log("info", "[Utils] [HTTP] iOS环境降级使用pako解压");
+          log("info", "[system] [http] iOS环境降级使用pako解压");
           try {
             // 动态导入pako库
             const pako = await import('pako');
@@ -203,6 +220,11 @@ export async function httpGet(url, options = {}) {
       // 请求成功，返回结果
       if (attempt > 0) {
         log("info", `[${currentSource}] [请求模拟] 重试成功`);
+      }
+
+      // 将本次响应记入请求内复用缓存, 供同请求内相同 URL 的后续请求直接复用
+      if (requestHttpCache && !bypassCache) {
+        requestHttpCache.set(url, { data: structuredClone(parsedData), status: response.status, headers });
       }
 
       // 模拟 iOS 环境：返回 { data: ... } 结构
@@ -309,7 +331,7 @@ export async function httpPost(url, body, options = {}) {
       // 兼容iOS巨魔环境：使用node-fetch替代内置fetch
       let response;
       if (typeof WebAssembly === 'undefined') {
-        log("info", "[Utils] [HTTP] iOS环境降级使用node-fetch");
+        log("info", "[system] [http] iOS环境降级使用node-fetch");
         const fetch = (await import('node-fetch')).default;
         response = await fetch(url, fetchOptions);
       } else {
@@ -518,7 +540,7 @@ export async function getPageTitle(url) {
 export function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 
+    headers: {
       "Content-Type": "application/json",
       "Access-Control-Allow-Origin": "*"
     }
@@ -534,8 +556,19 @@ export function xmlResponse(data, status = 200) {
   // 直接返回 XML 字符串作为 Response 的 body
   return new Response(data, {
     status,
-    headers: { 
+    headers: {
       "Content-Type": "application/xml",
+      "Access-Control-Allow-Origin": "*"
+    }
+  });
+}
+
+export function binResponse(data, filename = "data.bin", status = 200) {
+  return new Response(data, {
+    status,
+    headers: {
+      "Content-Type": "application/octet-stream",
+      "Content-Disposition": `attachment; filename="${filename}"`,
       "Access-Control-Allow-Origin": "*"
     }
   });
@@ -698,8 +731,8 @@ export async function httpGetWithStreamCheck(url, options = {}, checkCallback) {
       const text = await response.text();
       clearTimeout(timeoutId);
       if (checkCallback && !checkCallback(text.slice(0, SNIFF_LIMIT))) {
-          log("info", `[${currentSource}] [流式请求] 检测到无效数据(回退模式),丢弃结果`);
-          return null;
+        log("info", `[${currentSource}] [流式请求] 检测到无效数据(回退模式),丢弃结果`);
+        return null;
       }
       try { return JSON.parse(text); } catch { return text; }
     }
@@ -713,7 +746,7 @@ export async function httpGetWithStreamCheck(url, options = {}, checkCallback) {
     let stopChecking = false; // 标记是否停止检查
 
     // 流式读取循环
-    while(true) {
+    while (true) {
       const { done, value } = await reader.read();
 
       if (done) break;
@@ -724,7 +757,7 @@ export async function httpGetWithStreamCheck(url, options = {}, checkCallback) {
       // 1. 数据嗅探逻辑 (仅在前 SNIFF_LIMIT 范围内执行)
       if (!stopChecking && checkCallback) {
         // 累积文本
-        const chunkText = new TextDecoder("utf-8").decode(value, {stream: true});
+        const chunkText = new TextDecoder("utf-8").decode(value, { stream: true });
         checkBuffer += chunkText;
 
         // 执行回调检查
@@ -738,8 +771,8 @@ export async function httpGetWithStreamCheck(url, options = {}, checkCallback) {
 
         // 如果缓冲区超过限制
         if (receivedLength > SNIFF_LIMIT) {
-            stopChecking = true;
-            checkBuffer = null; // 释放缓冲区内存
+          stopChecking = true;
+          checkBuffer = null; // 释放缓冲区内存
         }
       }
 
@@ -753,7 +786,7 @@ export async function httpGetWithStreamCheck(url, options = {}, checkCallback) {
     // 2. 拼接完整数据
     let chunksAll = new Uint8Array(receivedLength);
     let position = 0;
-    for(let chunk of chunks) {
+    for (let chunk of chunks) {
       chunksAll.set(chunk, position);
       position += chunk.length;
     }
@@ -769,7 +802,7 @@ export async function httpGetWithStreamCheck(url, options = {}, checkCallback) {
     const currentSource = sourceLogContext.getStore() || "system";
     clearTimeout(timeoutId);
     if (error.name === 'AbortError') {
-       return null;
+      return null;
     }
     log("error", `[${currentSource}] [流式请求] 失败: ${error.message}`);
     return null;
